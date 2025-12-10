@@ -1,0 +1,20 @@
+#### Add the following Repo to CentOS/Rocky #####
+sudo dnf config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+
+##### Change gpgcheck from 1 to 0 ######
+sudo sed -i 's/gpgcheck=1/gpgcheck=0/' /etc/yum.repos.d/docker-ce.repo
+cat /etc/yum.repos.d/docker-ce.repo
+
+#### Update and install docker packages ######
+sudo dnf update
+sudo dnf install docker-ce docker-ce-cli containerd.io --allowerasing
+
+##### Enable/Start Docker services #####
+sudo systemctl enable docker docker.socket  containerd
+sudo systemctl start docker docker.socket  containerd
+
+sudo docker images
+sudo usermod -aG docker  $USER
+## Change $USER to your Account username OR leave it
+
+
