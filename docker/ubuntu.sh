@@ -6,7 +6,7 @@ sudo apt install gnupg apt-transport-https ca-certificates curl software-propert
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
 sudo add-apt-repository "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
 
-sudo apt update
+sudo apt -y update
 sudo apt -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-registry
 sudo usermod -aG docker $USER
 newgrp docker
