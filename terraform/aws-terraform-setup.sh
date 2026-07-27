@@ -20,6 +20,34 @@ skip()     { echo -e "${BLUE}[~]${NC} $1 — already installed, skipping."; }
 validate() { echo -e "${BLUE}[?]${NC} Validating: $1"; }
 
 # ============================================================
+#  Distro detection
+# ============================================================
+detect_distro() {
+  [[ -f /etc/os-release ]] || error "Cannot detect OS: /etc/os-release not found."
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  DISTRO_ID="${ID:-}"
+  DISTRO_LIKE="${ID_LIKE:-}"
+
+  if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]; then
+    PKG_MGR="apt"
+    PKG_UPDATE="sudo apt update -y"
+    PKG_INSTALL="sudo apt install -y"
+    DEBIAN_FAMILY=true
+  elif [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]; then
+    PKG_MGR="dnf"
+    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
+    PKG_UPDATE="sudo $PKG_MGR check-update -y || true"
+    PKG_INSTALL="sudo $PKG_MGR install -y"
+    DEBIAN_FAMILY=false
+  else
+    error "Unsupported distro: $DISTRO_ID. Supported: Ubuntu, Debian, RHEL, CentOS, Rocky, AlmaLinux, Fedora."
+  fi
+}
+
+detect_distro
+
+# ============================================================
 # 1. التحقق من المتطلبات الأساسية
 # ============================================================
 log "Checking prerequisites..."
@@ -32,10 +60,14 @@ success "All prerequisites met."
 # 2. تحديث النظام وتثبيت الأدوات
 # ============================================================
 log "Updating system..."
-sudo apt update -y
+$PKG_UPDATE
 
 log "Installing dependencies..."
-sudo apt install -y unzip curl gnupg software-properties-common lsb-release
+if [[ "$DEBIAN_FAMILY" == true ]]; then
+  $PKG_INSTALL unzip curl gnupg software-properties-common lsb-release
+else
+  $PKG_INSTALL unzip curl gnupg
+fi
 
 # ============================================================
 # 3. تثبيت AWS CLI — مع validation + cleanup
@@ -68,18 +100,28 @@ if command -v terraform &> /dev/null; then
     TF_INSTALLED=$(terraform version 2>/dev/null | head -1 || echo "unknown version")
     skip "Terraform — ${TF_INSTALLED}"
 else
-    log "Adding HashiCorp GPG key..."
-    curl -fsSL https://apt.releases.hashicorp.com/gpg \
-        | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg \
-        || error "فشل إضافة GPG key!"
+    if [[ "$DEBIAN_FAMILY" == true ]]; then
+      log "Adding HashiCorp GPG key..."
+      curl -fsSL https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg \
+          || error "فشل إضافة GPG key!"
 
-    log "Adding HashiCorp apt repository..."
-    echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
-        | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
+      log "Adding HashiCorp apt repository..."
+      echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
 
-    log "Updating apt and installing Terraform..."
-    sudo apt update -y
-    sudo apt install -y terraform || error "فشل تثبيت Terraform!"
+      log "Updating apt and installing Terraform..."
+      sudo apt update -y
+      sudo apt install -y terraform || error "فشل تثبيت Terraform!"
+    else
+      log "Adding HashiCorp yum repository..."
+      $PKG_INSTALL dnf-plugins-core 2>/dev/null || true
+      sudo $PKG_MGR config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo 2>/dev/null \
+        || sudo $PKG_MGR config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+
+      log "Installing Terraform..."
+      sudo $PKG_MGR install -y terraform || error "فشل تثبيت Terraform!"
+    fi
 
     success "Terraform installed: $(terraform version | head -1)"
 fi

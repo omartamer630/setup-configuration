@@ -11,6 +11,29 @@ ok()   { echo -e "${GREEN}[✔] $1${NC}"; }
 err()  { echo -e "${RED}[✘] $1${NC}"; }
 info() { echo -e "${YELLOW}[~] $1${NC}"; }
 
+# ─── 0. Distro detection ─────────────────────────────────
+detect_distro() {
+  [[ -f /etc/os-release ]] || err "Cannot detect OS: /etc/os-release not found."
+  source /etc/os-release
+  DISTRO_ID="${ID:-}"
+  DISTRO_LIKE="${ID_LIKE:-}"
+
+  if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]; then
+    PKG_UPDATE="sudo apt update -q"
+    PKG_INSTALL="sudo apt install -y"
+  elif [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]; then
+    PKG_MGR="dnf"
+    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
+    PKG_UPDATE="sudo $PKG_MGR check-update -q || true"
+    PKG_INSTALL="sudo $PKG_MGR install -y"
+  else
+    err "Unsupported distro: $DISTRO_ID. Supported: Ubuntu, Debian, RHEL, CentOS, Rocky, AlmaLinux, Fedora."
+    exit 1
+  fi
+}
+
+detect_distro
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── 1. zsh ───────────────────────────────────────────────
@@ -19,7 +42,7 @@ if command -v zsh &>/dev/null; then
   ok "zsh is already installed ($(zsh --version))"
 else
   info "Installing zsh..."
-  sudo apt update -q && sudo apt install -y zsh
+  $PKG_UPDATE && $PKG_INSTALL zsh
   ok "zsh installed successfully"
 fi
 
@@ -66,7 +89,7 @@ if command -v autojump &>/dev/null || [ -f /usr/share/autojump/autojump.sh ]; th
   ok "autojump is already installed"
 else
   info "Installing autojump..."
-  sudo apt install -y autojump
+  $PKG_INSTALL autojump
   ok "autojump installed successfully"
 fi
 

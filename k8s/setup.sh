@@ -20,6 +20,32 @@ skip()     { echo -e "${BLUE}[~]${NC} $1 — already installed, skipping."; }
 validate() { echo -e "${BLUE}[?]${NC} Validating: $1"; }
 
 # ============================================================
+#  Distro detection
+# ============================================================
+detect_distro() {
+  [[ -f /etc/os-release ]] || error "Cannot detect OS: /etc/os-release not found."
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  DISTRO_ID="${ID:-}"
+  DISTRO_LIKE="${ID_LIKE:-}"
+
+  if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]; then
+    PKG_MGR="apt"
+    PKG_UPDATE="sudo apt update -y"
+    PKG_INSTALL="sudo apt install -y"
+  elif [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]; then
+    PKG_MGR="dnf"
+    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
+    PKG_UPDATE="sudo $PKG_MGR check-update -y || true"
+    PKG_INSTALL="sudo $PKG_MGR install -y"
+  else
+    error "Unsupported distro: $DISTRO_ID. Supported: Ubuntu, Debian, RHEL, CentOS, Rocky, AlmaLinux, Fedora."
+  fi
+}
+
+detect_distro
+
+# ============================================================
 # 1. التحقق من المتطلبات الأساسية
 # ============================================================
 log "Checking prerequisites..."
@@ -35,10 +61,11 @@ success "All prerequisites met."
 # 2. تحديث النظام وتثبيت الأدوات
 # ============================================================
 log "Updating system..."
-sudo apt update -y
+$PKG_UPDATE
 
 log "Installing dependencies..."
-sudo apt install -y curl git apt-transport-https ca-certificates
+$PKG_INSTALL curl git ca-certificates
+$PKG_INSTALL apt-transport-https 2>/dev/null || true
 
 # ============================================================
 # 3. تثبيت kubectl — مع validation
