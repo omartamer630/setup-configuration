@@ -21,7 +21,7 @@ die()  { echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
 # ---------- pre-flight checks ------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Please run this script with sudo/root (e.g. sudo $0)."
 
-TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) TARGET_USER="$2"; shift 2 ;;
