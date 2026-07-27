@@ -6,9 +6,8 @@
 # latest Docker Engine + Compose plugin from Docker's official repos.
 #
 # Usage:
-#   sudo ./install-docker.sh            # install docker if missing
-#   sudo ./install-docker.sh --user bob # add "bob" to the docker group
-#                                        # instead of the invoking user
+#   sudo ./install-docker.sh   # install docker if missing, add invoking
+#                               # (non-root) user to the docker group
 #
 set -euo pipefail
 trap 'echo -e "\n[ERROR] Script failed at line $LINENO. Aborting." >&2' ERR
@@ -21,16 +20,59 @@ die()  { echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
 # ---------- pre-flight checks ------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Please run this script with sudo/root (e.g. sudo $0)."
 
-TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --user) TARGET_USER="$2"; shift 2 ;;
-    -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) die "Unknown argument: $1" ;;
-  esac
-done
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
 
-command -v curl >/dev/null 2>&1 || die "curl is required but not installed. Install it first."
+TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+
+# ---------- distro detection --------------------------------------------------
+[[ -f /etc/os-release ]] || die "Cannot detect OS: /etc/os-release not found."
+# shellcheck disable=SC1091
+source /etc/os-release
+DISTRO_ID="${ID:-}"
+DISTRO_LIKE="${ID_LIKE:-}"
+
+is_debian_family() {
+  [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]
+}
+is_rhel_family() {
+  [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]
+}
+
+# ---------- prerequisites: install curl/ca-certificates/gnupg if missing -----
+ensure_prereqs() {
+  local missing=()
+  for pkg_bin in curl gpg; do
+    command -v "$pkg_bin" >/dev/null 2>&1 || missing+=("$pkg_bin")
+  done
+  # ca-certificates has no matching binary, check the package itself instead.
+  local need_ca_certs=false
+  if is_debian_family; then
+    dpkg -s ca-certificates >/dev/null 2>&1 || need_ca_certs=true
+  fi
+
+  if [[ ${#missing[@]} -eq 0 && "$need_ca_certs" == false ]]; then
+    return 0
+  fi
+
+  local extra=""
+  [[ "$need_ca_certs" == true ]] && extra="ca-certificates"
+  log "Missing prerequisites detected: ${missing[*]:-} ${extra}. Installing..."
+  if is_debian_family; then
+    apt-get update -y
+    apt-get install -y curl gnupg ca-certificates
+  elif is_rhel_family; then
+    PKG_MGR="dnf"
+    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
+    "$PKG_MGR" -y install curl gnupg ca-certificates
+  else
+    die "Unsupported distro: $DISTRO_ID. Cannot auto-install prerequisites."
+  fi
+}
+
+ensure_prereqs
 
 # ---------- is docker already installed? -------------------------------------
 if command -v docker >/dev/null 2>&1; then
@@ -45,20 +87,10 @@ if command -v docker >/dev/null 2>&1; then
   exit 0
 fi
 
-log "Docker not found. Detecting distro..."
-
-# ---------- distro detection --------------------------------------------------
-[[ -f /etc/os-release ]] || die "Cannot detect OS: /etc/os-release not found."
-# shellcheck disable=SC1091
-source /etc/os-release
-DISTRO_ID="${ID:-}"
-DISTRO_LIKE="${ID_LIKE:-}"
+log "Docker not found. Proceeding with installation for $PRETTY_NAME..."
 
 install_debian() {
   log "Detected Debian/Ubuntu family ($PRETTY_NAME). Installing latest Docker..."
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg
-
   install -m 0755 -d /etc/apt/keyrings
   if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
     curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" \
