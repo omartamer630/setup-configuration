@@ -147,6 +147,75 @@ CLUSTER_NAME="kind"
 
 [ -f "kind-config.yml" ] || error "kind-config.yml مش موجود في $(pwd)!"
 
+# ============================================================
+# 6a. Port availability check (kind-config.yml port mappings)
+# ============================================================
+REQUIRED_PORTS=(80 443 30000 30001)
+PORT_ERROR_MSG=""
+
+detect_port_process() {
+  local port=$1
+  local pid process
+  if command -v ss &>/dev/null; then
+    pid=$(ss -tlnp "sport = :$port" 2>/dev/null | awk -F'pid=' 'NR>1{print $2}' | cut -d, -f1 | head -1)
+    process=$(ss -tlnp "sport = :$port" 2>/dev/null | awk -F'users:' 'NR>1{print $2}' | tr -d '()"' | head -1)
+    [ -z "$process" ] && process="PID $pid"
+  elif command -v lsof &>/dev/null; then
+    process=$(lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)
+    [ -n "$process" ] && process="PID $process" || process=""
+  fi
+  echo "$process"
+}
+
+for port in "${REQUIRED_PORTS[@]}"; do
+  if command -v ss &>/dev/null; then
+    if ss -tln "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+      proc=$(detect_port_process "$port")
+      PORT_ERROR_MSG+="  - Port $port is in use by $proc"$'\n'
+    fi
+  elif command -v lsof &>/dev/null; then
+    if lsof -i :"$port" -sTCP:LISTEN &>/dev/null 2>&1; then
+      proc=$(detect_port_process "$port")
+      PORT_ERROR_MSG+="  - Port $port is in use by $proc"$'\n'
+    fi
+  else
+    # fallback: try a simple curl-based check
+    if (echo >/dev/tcp/0.0.0.0/"$port") &>/dev/null 2>&1; then
+      PORT_ERROR_MSG+="  - Port $port is already in use"$'\n'
+    fi
+  fi
+done
+
+if [ -n "$PORT_ERROR_MSG" ]; then
+  warn "The following ports are required by kind-config.yml but are already in use:"
+  echo -e "$PORT_ERROR_MSG"
+  echo ""
+  echo "To resolve, either:"
+  echo "  1) Stop the service using the port, e.g.:"
+  echo "     sudo systemctl stop nginx"
+  echo "     # or"
+  echo "     sudo lsof -i :80 -sTCP:LISTEN -t | xargs sudo kill"
+  echo ""
+  echo "  2) Or edit kind-config.yml to use different hostPort values"
+  echo ""
+  read -rp "Press Enter after freeing the ports (or Ctrl+C to abort)... "
+  # re-check after user action
+  for port in "${REQUIRED_PORTS[@]}"; do
+    if command -v ss &>/dev/null; then
+      if ss -tln "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+        error "Port $port is still in use. Aborting."
+      fi
+    elif command -v lsof &>/dev/null; then
+      if lsof -i :"$port" -sTCP:LISTEN &>/dev/null 2>&1; then
+        error "Port $port is still in use. Aborting."
+      fi
+    fi
+  done
+fi
+
+# ============================================================
+# 7. إنشاء Kind Cluster — مع validation
+# ============================================================
 validate "Kind cluster '${CLUSTER_NAME}'"
 if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
     skip "Cluster '${CLUSTER_NAME}'"
