@@ -9,7 +9,7 @@
 | [`docker/`](docker/) | Install Docker Engine + Compose | Debian/Ubuntu & RHEL-based |
 | [`k8s/`](k8s/) | Spin up a local Kubernetes cluster with Kind + ingress-nginx | Debian/Ubuntu & RHEL-based |
 | [`terraform/`](terraform/) | Install AWS CLI v2 and Terraform | Debian/Ubuntu & RHEL-based |
-| [`wsl-setup/`](wsl-setup/) | Bootstrap a WSL environment: Zsh, Oh My Zsh, plugins, theme | Debian/Ubuntu & RHEL-based |
+| [`machine-setup/`](machine-setup/) | Bootstrap a WSL environment: Zsh, Oh My Zsh, plugins, theme | Debian/Ubuntu & RHEL-based |
 
 ---
 
@@ -47,7 +47,7 @@ Auto-detects your distro, installs AWS CLI v2 (from the official bundled zip) an
 bash terraform/aws-terraform-setup.sh
 ```
 
-### WSL Setup
+### Machine Setup
 
 Bootstraps a Windows Subsystem for Linux environment:
 
@@ -60,7 +60,7 @@ Bootstraps a Windows Subsystem for Linux environment:
 - Extends `sudo` timeout to 24 hours
 
 ```bash
-bash wsl-setup/setup.sh
+bash machine-setup/setup.sh
 ```
 
 ---
