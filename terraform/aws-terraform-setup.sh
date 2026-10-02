@@ -1,9 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # ============================================================
-#  AWS CLI + Terraform Setup Script
-#  مع error handling + validation + cleanup
+#  AWS CLI + Terraform Setup Script  (apt / dnf / yum / pacman / zypper / apk)
+#  Usage: ./terraform/aws-terraform-setup.sh      (sudo is used when needed)
+#  Env:   SKIP_UPDATE=1  skip system update
+#         TERRAFORM_VERSION=1.9.8  force a specific Terraform version
 # ============================================================
 
 RED='\033[0;31m'
@@ -14,116 +16,179 @@ NC='\033[0m'
 
 log()      { echo -e "${GREEN}[+]${NC} $1"; }
 warn()     { echo -e "${YELLOW}[!]${NC} $1"; }
-error()    { echo -e "${RED}[-]${NC} $1"; exit 1; }
+error()    { echo -e "${RED}[-]${NC} $1" >&2; exit 1; }
 success()  { echo -e "${GREEN}[✔]${NC} $1"; }
 skip()     { echo -e "${BLUE}[~]${NC} $1 — already installed, skipping."; }
 validate() { echo -e "${BLUE}[?]${NC} Validating: $1"; }
 
 # ============================================================
-#  Distro detection
+#  Load package manager abstraction
 # ============================================================
-detect_distro() {
-  [[ -f /etc/os-release ]] || error "Cannot detect OS: /etc/os-release not found."
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  DISTRO_ID="${ID:-}"
-  DISTRO_LIKE="${ID_LIKE:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/pkg.sh
+source "$SCRIPT_DIR/../lib/pkg.sh"
 
-  if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]; then
-    PKG_MGR="apt"
-    PKG_UPDATE="sudo apt update -y"
-    PKG_INSTALL="sudo apt install -y"
-    DEBIAN_FAMILY=true
-  elif [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]; then
-    PKG_MGR="dnf"
-    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
-    PKG_UPDATE="sudo $PKG_MGR check-update -y || true"
-    PKG_INSTALL="sudo $PKG_MGR install -y"
-    DEBIAN_FAMILY=false
-  else
-    error "Unsupported distro: $DISTRO_ID. Supported: Ubuntu, Debian, RHEL, CentOS, Rocky, AlmaLinux, Fedora."
-  fi
-}
-
-detect_distro
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 # ============================================================
-# 1. التحقق من المتطلبات الأساسية
+# 1. تحديث النظام وتثبيت الأدوات الأساسية (قبل الـ prerequisites check)
+# ============================================================
+log "Updating system..."
+pkg_update
+
+log "Installing dependencies..."
+pkg_install unzip curl gnupg
+if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+  pkg_install lsb-release ca-certificates
+fi
+
+# ============================================================
+# 2. التحقق من المتطلبات الأساسية
 # ============================================================
 log "Checking prerequisites..."
-command -v curl &> /dev/null   || error "curl غير موجود!"
-command -v unzip &> /dev/null  || error "unzip غير موجود!"
-command -v gpg &> /dev/null    || error "gpg غير موجود!"
+command -v curl  &> /dev/null || error "curl غير موجود!"
+command -v unzip &> /dev/null || error "unzip غير موجود!"
+command -v gpg   &> /dev/null || error "gpg غير موجود!"
 success "All prerequisites met."
 
 # ============================================================
-# 2. تحديث النظام وتثبيت الأدوات
+# 3. AWS CLI
 # ============================================================
-log "Updating system..."
-$PKG_UPDATE
+install_awscli_zip() {
+  local arch; arch="$(detect_arch_uname)"
+  [[ "$arch" != "unsupported" ]] || error "Unsupported CPU architecture: $(uname -m)"
 
-log "Installing dependencies..."
-if [[ "$DEBIAN_FAMILY" == true ]]; then
-  $PKG_INSTALL unzip curl gnupg software-properties-common lsb-release
-else
-  $PKG_INSTALL unzip curl gnupg
-fi
+  log "Downloading AWS CLI v2 ($arch)..."
+  download "$TMP_DIR/awscliv2.zip" \
+    "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip" \
+    || { network_hint; error "فشل تحميل AWS CLI!"; }
 
-# ============================================================
-# 3. تثبيت AWS CLI — مع validation + cleanup
-# ============================================================
+  log "Extracting AWS CLI..."
+  unzip -q "$TMP_DIR/awscliv2.zip" -d "$TMP_DIR" || error "فشل فك الضغط!"
+
+  log "Installing AWS CLI..."
+  $SUDO "$TMP_DIR/aws/install" --update || error "فشل تثبيت AWS CLI!"
+}
+
 validate "AWS CLI"
 if command -v aws &> /dev/null; then
-    AWS_INSTALLED=$(aws --version 2>&1 || echo "unknown version")
-    skip "AWS CLI — ${AWS_INSTALLED}"
+  skip "AWS CLI — $(aws --version 2>&1 || echo 'unknown version')"
 else
-    log "Downloading AWS CLI..."
-    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
-        || error "فشل تحميل AWS CLI!"
-
-    log "Extracting AWS CLI..."
-    unzip -q awscliv2.zip || error "فشل فك الضغط!"
-
-    log "Installing AWS CLI..."
-    sudo ./aws/install || error "فشل تثبيت AWS CLI!"
-
-    log "Cleaning up AWS CLI installer..."
-    rm -rf aws awscliv2.zip
-    success "AWS CLI installed: $(aws --version 2>&1)"
+  case "$PKG_MANAGER" in
+    pacman|apk)
+      # Native package (Alpine needs it: the official zip is glibc-only)
+      log "Installing AWS CLI from $PKG_MANAGER repos..."
+      pkg_install awscli || { warn "Package install failed, trying official installer..."; install_awscli_zip; }
+      ;;
+    *)
+      install_awscli_zip
+      ;;
+  esac
+  hash -r
+  success "AWS CLI installed: $(aws --version 2>&1)"
 fi
 
 # ============================================================
-# 4. تثبيت Terraform — مع validation
+# 4. Terraform
 # ============================================================
+# Direct binary install from releases.hashicorp.com (checksum-verified).
+# Used on distros without an official HashiCorp repo (Arch, openSUSE, Alpine)
+# and as a fallback when the apt/rpm repo route fails.
+install_terraform_binary() {
+  local arch version base zip sums
+  arch="$(detect_arch)"
+  [[ "$arch" != "unsupported" ]] || error "Unsupported CPU architecture: $(uname -m)"
+
+  version="${TERRAFORM_VERSION:-}"
+  if [[ -z "$version" ]]; then
+    version="$(curl -fsSL --connect-timeout 10 --max-time 20 \
+      https://checkpoint-api.hashicorp.com/v1/check/terraform 2>/dev/null \
+      | grep -o '"current_version":"[^"]*"' | cut -d'"' -f4 || true)"
+  fi
+  if [[ -z "$version" ]]; then
+    version="1.9.8"
+    warn "Could not detect the latest Terraform version — falling back to ${version}."
+  fi
+
+  base="https://releases.hashicorp.com/terraform/${version}"
+  zip="terraform_${version}_linux_${arch}.zip"
+  sums="terraform_${version}_SHA256SUMS"
+
+  log "Downloading Terraform ${version} (${arch})..."
+  download "$TMP_DIR/$zip"  "${base}/${zip}"  || { network_hint; error "فشل تحميل Terraform!"; }
+  download "$TMP_DIR/$sums" "${base}/${sums}" || error "فشل تحميل checksums!"
+
+  log "Verifying checksum..."
+  ( cd "$TMP_DIR" && grep " ${zip}\$" "$sums" | sha256sum -c - ) \
+    || error "Terraform checksum mismatch!"
+
+  unzip -qo "$TMP_DIR/$zip" terraform -d "$TMP_DIR" || error "فشل فك الضغط!"
+  $SUDO install -m 0755 "$TMP_DIR/terraform" /usr/local/bin/terraform
+}
+
+install_terraform_apt() {
+  log "Adding HashiCorp GPG key..."
+  $SUDO install -m 0755 -d /usr/share/keyrings
+  curl -fsSL --connect-timeout 15 https://apt.releases.hashicorp.com/gpg \
+    | $SUDO gpg --dearmor --yes -o /usr/share/keyrings/hashicorp.gpg \
+    || return 1
+
+  local codename
+  codename="$( (. /etc/os-release; echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}") )"
+  [[ -n "$codename" ]] || codename="$(lsb_release -cs 2>/dev/null || true)"
+  [[ -n "$codename" ]] || return 1
+
+  log "Adding HashiCorp apt repository ($codename)..."
+  echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com ${codename} main" \
+    | $SUDO tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
+
+  pkg_update
+  pkg_install terraform
+}
+
+install_terraform_rpm() {
+  local id repo_path
+  id="$( (. /etc/os-release; echo "${ID:-}") )"
+  case "$id" in
+    fedora) repo_path="fedora" ;;
+    amzn)   repo_path="AmazonLinux" ;;
+    *)      repo_path="RHEL" ;;
+  esac
+
+  # Write the repo file directly: `dnf config-manager --add-repo` differs
+  # between dnf4 / dnf5 / yum and is what broke on non-RPM systems.
+  log "Adding HashiCorp rpm repository (${repo_path})..."
+  $SUDO tee /etc/yum.repos.d/hashicorp.repo > /dev/null <<REPO
+[hashicorp]
+name=HashiCorp Stable - \$basearch
+baseurl=https://rpm.releases.hashicorp.com/${repo_path}/\$releasever/\$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.releases.hashicorp.com/gpg
+REPO
+  pkg_install terraform
+}
+
 validate "Terraform"
 if command -v terraform &> /dev/null; then
-    TF_INSTALLED=$(terraform version 2>/dev/null | head -1 || echo "unknown version")
-    skip "Terraform — ${TF_INSTALLED}"
+  skip "Terraform — $(terraform version 2>/dev/null | head -1 || echo 'unknown version')"
 else
-    if [[ "$DEBIAN_FAMILY" == true ]]; then
-      log "Adding HashiCorp GPG key..."
-      curl -fsSL https://apt.releases.hashicorp.com/gpg \
-          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg \
-          || error "فشل إضافة GPG key!"
-
-      log "Adding HashiCorp apt repository..."
-      echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
-          | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
-
-      log "Updating apt and installing Terraform..."
-      sudo apt update -y
-      sudo apt install -y terraform || error "فشل تثبيت Terraform!"
-    else
-      log "Adding HashiCorp yum repository..."
-      $PKG_INSTALL dnf-plugins-core 2>/dev/null || true
-      sudo $PKG_MGR config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo 2>/dev/null \
-        || sudo $PKG_MGR config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
-
-      log "Installing Terraform..."
-      sudo $PKG_MGR install -y terraform || error "فشل تثبيت Terraform!"
-    fi
-
-    success "Terraform installed: $(terraform version | head -1)"
+  case "$PKG_MANAGER" in
+    apt-get)
+      install_terraform_apt || { warn "apt repo install failed — using direct download."; install_terraform_binary; }
+      ;;
+    dnf|yum)
+      install_terraform_rpm || { warn "rpm repo install failed — using direct download."; install_terraform_binary; }
+      ;;
+    *)
+      # pacman: terraform was removed from the official Arch repos (license change)
+      log "No official HashiCorp repo for '$PKG_MANAGER' — installing the official binary."
+      install_terraform_binary
+      ;;
+  esac
+  hash -r
+  success "Terraform installed: $(terraform version | head -1)"
 fi
 
 # ============================================================

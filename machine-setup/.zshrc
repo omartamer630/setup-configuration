@@ -14,8 +14,14 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
-# في Ubuntu/Debian
-source /usr/share/autojump/autojump.sh
+# Autojump - cross-distro support
+if [[ -f /usr/share/autojump/autojump.sh ]]; then
+  source /usr/share/autojump/autojump.sh  # Debian/Ubuntu
+elif [[ -f /etc/profile.d/autojump.sh ]]; then
+  source /etc/profile.d/autojump.sh      # Arch/Manjaro/EndeavourOS
+elif [[ -f /usr/share/autojump/autojump.zsh ]]; then
+  source /usr/share/autojump/autojump.zsh # openSUSE/Fedora
+fi
 
 # opencode
 export PATH=/home/omart/.opencode/bin:$PATH
