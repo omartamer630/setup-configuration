@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 #
-# install-docker.sh
-# Checks whether Docker is already installed; if not, detects the distro
-# (Debian/Ubuntu or RHEL/CentOS/Rocky/AlmaLinux/Fedora) and installs the
-# latest Docker Engine + Compose plugin from Docker's official repos.
+# docker/setup.sh
+# Installs Docker Engine + Compose if missing (apt / dnf / yum / pacman /
+# zypper / apk), starts the service, and adds the invoking user to the
+# `docker` group so `docker` works without sudo.
 #
 # Usage:
-#   sudo ./install-docker.sh   # install docker if missing, add invoking
-#                               # (non-root) user to the docker group
+#   sudo ./docker/setup.sh
 #
 set -euo pipefail
 trap 'echo -e "\n[ERROR] Script failed at line $LINENO. Aborting." >&2' ERR
@@ -17,86 +16,133 @@ log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
 
-# ---------- load package manager abstraction --------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
-# shellcheck source=../lib/pkg.sh
-source "$LIB_DIR/pkg.sh"
-
-# ---------- pre-flight checks ------------------------------------------------
-[[ $EUID -eq 0 ]] || die "Please run this script with sudo/root (e.g. sudo $0)."
-
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
-TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+# ---------- need root: re-run ourselves with sudo ----------------------------
+if [[ $EUID -ne 0 ]]; then
+  command -v sudo >/dev/null 2>&1 || die "Run as root (sudo not found)."
+  exec sudo -E bash "$0" "$@"
+fi
 
-# ---------- distro info (for Docker repo selection) ---------------------------
+# ---------- load package manager abstraction --------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/pkg.sh
+source "$SCRIPT_DIR/../lib/pkg.sh"
+
+# The real (non-root) user who should get docker access
+TARGET_USER="${SUDO_USER:-}"
+[[ -n "$TARGET_USER" && "$TARGET_USER" != "root" ]] || TARGET_USER=""
+
+# ---------- distro info -------------------------------------------------------
 [[ -f /etc/os-release ]] || die "Cannot detect OS: /etc/os-release not found."
 # shellcheck disable=SC1091
 source /etc/os-release
 DISTRO_ID="${ID:-}"
 DISTRO_LIKE="${ID_LIKE:-}"
-PRETTY_NAME="${PRETTY_NAME:-$NAME}"
+PRETTY_NAME="${PRETTY_NAME:-${NAME:-Linux}}"
+
+add_user_to_docker_group() {
+  if [[ -z "$TARGET_USER" ]]; then
+    warn "No non-root user detected (running as real root) — skipping group setup."
+    return 0
+  fi
+  getent group docker >/dev/null || groupadd docker
+  if id -nG "$TARGET_USER" | grep -qw docker; then
+    log "$TARGET_USER is already in the docker group."
+  else
+    log "Adding $TARGET_USER to the docker group..."
+    usermod -aG docker "$TARGET_USER"
+  fi
+  warn "Group changes need a new login session: log out/in, or run 'newgrp docker'."
+  warn "Until then you can use:  sudo docker ...   or   sg docker -c 'docker ps'"
+}
+
+verify() {
+  log "Verifying installation..."
+  docker --version
+  docker compose version 2>/dev/null || warn "docker compose plugin not found."
+  if docker info >/dev/null 2>&1; then
+    log "Docker daemon is running."
+  else
+    warn "Docker daemon is not responding yet. Check: systemctl status docker"
+  fi
+}
 
 # ---------- is docker already installed? -------------------------------------
 if command -v docker >/dev/null 2>&1; then
   log "Docker is already installed: $(docker --version)"
-  enable_service docker
-  if ! id -nG "$TARGET_USER" | grep -qw docker; then
-    log "Adding $TARGET_USER to the docker group..."
-    usermod -aG docker "$TARGET_USER"
-    warn "Log out and back in (or run 'newgrp docker') for group changes to apply."
-  fi
-  log "Nothing to do."
+  enable_service docker || true
+  add_user_to_docker_group
+  verify
+  log "Nothing more to do."
   exit 0
 fi
 
 log "Docker not found. Proceeding with installation for $PRETTY_NAME..."
 
-# Docker installation varies by package manager family
 case "$PKG_MANAGER" in
   apt-get)
-    log "Detected Debian/Ubuntu family. Installing Docker from Docker's official repos..."
-    install -m 0755 -d /etc/apt/keyrings
-    if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-      curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-      chmod a+r /etc/apt/keyrings/docker.gpg
+    # Docker only publishes repos for debian/ubuntu — map derivatives (Mint, Pop!_OS, ...)
+    case "$DISTRO_ID" in
+      ubuntu|debian) REPO_ID="$DISTRO_ID" ;;
+      *) if [[ " $DISTRO_LIKE " == *" ubuntu "* ]]; then REPO_ID="ubuntu"; else REPO_ID="debian"; fi ;;
+    esac
+    if [[ "$REPO_ID" == "ubuntu" ]]; then
+      CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    else
+      CODENAME="${VERSION_CODENAME:-}"
     fi
+    [[ -n "$CODENAME" ]] || die "Could not determine the distro codename."
 
-    ARCH="$(dpkg --print-architecture)"
-    CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-$UBUNTU_CODENAME}")"
-    echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${DISTRO_ID} ${CODENAME} stable" \
+    log "Installing Docker CE from Docker's apt repo (${REPO_ID} ${CODENAME})..."
+    pkg_install ca-certificates curl gnupg
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL --connect-timeout 15 --retry 3 "https://download.docker.com/linux/${REPO_ID}/gpg" \
+      | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${REPO_ID} ${CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
 
     pkg_update
-    pkg_install docker
+    # Real package names (pkg_install's "docker" alias would pick docker.io instead)
+    pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     ;;
   dnf|yum)
-    log "Detected RHEL/Fedora family. Installing Docker from Docker's official repos..."
-    pkg_install dnf-plugins-core
-    if [[ "$DISTRO_ID" == "fedora" ]]; then
-      dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+    if [[ "$DISTRO_ID" == "amzn" ]]; then
+      log "Amazon Linux: installing docker from the distro repos..."
+      $SUDO "$PKG_MANAGER" install -y docker
     else
-      dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+      case "$DISTRO_ID" in
+        fedora) DOCKER_REPO="fedora" ;;
+        rhel)   DOCKER_REPO="rhel" ;;
+        *)      DOCKER_REPO="centos" ;;
+      esac
+      log "Installing Docker CE from Docker's rpm repo (${DOCKER_REPO})..."
+      pkg_install curl
+      # Download the .repo file directly: works on dnf4, dnf5 and yum
+      curl -fsSL --connect-timeout 15 --retry 3 \
+        "https://download.docker.com/linux/${DOCKER_REPO}/docker-ce.repo" \
+        -o /etc/yum.repos.d/docker-ce.repo
+      "$PKG_MANAGER" install -y --allowerasing \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
-    pkg_install docker --allowerasing
     ;;
   pacman)
-    log "Detected Arch-based distro. Installing Docker from official Arch repos..."
-    pkg_update
-    pkg_install docker
+    log "Arch-based distro: installing Docker from the official repos..."
+    pkg_update            # full upgrade (partial upgrades are unsupported on Arch)
+    pkg_install docker    # -> docker docker-compose docker-buildx
     ;;
   zypper)
-    log "Detected openSUSE. Installing Docker from official repos..."
+    log "openSUSE: installing Docker from the official repos..."
     pkg_update
     pkg_install docker
     ;;
   apk)
-    log "Detected Alpine Linux. Installing Docker from official repos..."
+    log "Alpine: installing Docker from the official repos..."
     pkg_update
     pkg_install docker
     ;;
@@ -110,26 +156,6 @@ log "Enabling and starting the docker service..."
 enable_service docker
 enable_service containerd 2>/dev/null || true
 
-log "Adding $TARGET_USER to the docker group..."
-groupadd -f docker
-usermod -aG docker "$TARGET_USER"
-
-# Apply group change immediately if running as the target user
-if [[ "$TARGET_USER" == "$(whoami)" ]] && command -v newgrp >/dev/null 2>&1; then
-  log "Applying docker group change..."
-  exec newgrp docker <<'EOF'
-  log "Verifying installation..."
-  docker --version
-  docker compose version
-  systemctl is-active --quiet docker && log "docker.service is active." || die "docker.service is not running."
-  warn "Log out and back in (or run 'newgrp docker') so group changes take effect."
-  log "Done. Try: docker run --rm hello-world"
-EOF
-else
-  log "Verifying installation..."
-  docker --version
-  docker compose version
-  systemctl is-active --quiet docker && log "docker.service is active." || die "docker.service is not running."
-  warn "Log out and back in (or run 'newgrp docker') so group changes take effect."
-  log "Done. Try: docker run --rm hello-world"
-fi
+add_user_to_docker_group
+verify
+log "Done. Try:  sudo docker run --rm hello-world"

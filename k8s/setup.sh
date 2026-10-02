@@ -1,9 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # ============================================================
-#  Kubernetes (Kind) Setup Script
-#  محسّن مع error handling + validation + webhook fix + cleanup
+#  Kubernetes (Kind) Setup Script  (apt / dnf / yum / pacman / zypper / apk)
+#  Usage:  sudo ./k8s/setup.sh        (or without sudo if your user can use docker)
+#  Env:    SKIP_UPDATE=1     skip system update
+#          KIND_VERSION=...  override Kind version
+#          KIND_URL=...      custom Kind binary URL (mirror)
+#  Behind a proxy/VPN? use:  sudo -E ./k8s/setup.sh
 # ============================================================
 
 RED='\033[0;31m'
@@ -14,286 +18,297 @@ NC='\033[0m'
 
 log()      { echo -e "${GREEN}[+]${NC} $1"; }
 warn()     { echo -e "${YELLOW}[!]${NC} $1"; }
-error()    { echo -e "${RED}[-]${NC} $1"; exit 1; }
+error()    { echo -e "${RED}[-]${NC} $1" >&2; exit 1; }
 success()  { echo -e "${GREEN}[✔]${NC} $1"; }
 skip()     { echo -e "${BLUE}[~]${NC} $1 — already installed, skipping."; }
 validate() { echo -e "${BLUE}[?]${NC} Validating: $1"; }
 
-# ============================================================
-#  Load package manager abstraction
-# ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 # shellcheck source=../lib/pkg.sh
-source "$LIB_DIR/pkg.sh"
+source "$SCRIPT_DIR/../lib/pkg.sh"
 
-# PKG_MANAGER is now detected and available from lib/pkg.sh
-# pkg_update, pkg_install, ensure functions are available
+TMP_DIR="$(mktemp -d)"
+
+# ------------------------------------------------------------
+# kubeconfig must belong to the REAL user, not root.
+# (When run via sudo, `kind` would otherwise write /root/.kube/config
+#  and your normal-user `kubectl` would never see the cluster.)
+# ------------------------------------------------------------
+KUBE_DIR="$TARGET_HOME/.kube"
+export KUBECONFIG="${KUBECONFIG:-$KUBE_DIR/config}"
+
+fix_ownership() {
+  if [[ $EUID -eq 0 && "$TARGET_USER" != "root" && -d "$KUBE_DIR" ]]; then
+    chown -R "$TARGET_USER":"$(id -gn "$TARGET_USER")" "$KUBE_DIR" 2>/dev/null || true
+  fi
+}
+cleanup() { rm -rf "$TMP_DIR"; fix_ownership; }
+trap cleanup EXIT
+
+mkdir -p "$KUBE_DIR"
 
 # ============================================================
-# 1. التحقق من المتطلبات الأساسية
+# 1. Prerequisites (Docker)
 # ============================================================
 log "Checking prerequisites..."
 
-command -v docker &> /dev/null || error "Docker غير مثبت! ثبّته الأول: https://docs.docker.com/engine/install/"
-docker info &> /dev/null       || error "Docker غير شغال! شغّله وحاول تاني."
-command -v curl &> /dev/null   || error "curl غير موجود!"
-command -v git &> /dev/null    || error "git غير موجود!"
+command -v docker &> /dev/null \
+  || error "Docker غير مثبت! شغّل الأول: sudo ./docker/setup.sh"
 
-success "All prerequisites met."
+if ! docker info &> /dev/null; then
+  if [[ $EUID -eq 0 ]] && command -v systemctl &> /dev/null; then
+    warn "Docker daemon مش شغال — بحاول أشغله..."
+    systemctl enable --now docker 2>/dev/null || true
+    sleep 3
+  fi
+  if ! docker info &> /dev/null; then
+    DOCKER_ERR="$(docker info 2>&1 | tail -3 || true)"
+    if grep -qi "permission denied" <<<"$DOCKER_ERR"; then
+      error "المستخدم '$TARGET_USER' مش عنده صلاحية على Docker.
+    الحل: sudo ./docker/setup.sh   (بيضيفك لجروب docker)
+    بعدها: logout/login أو شغّل  newgrp docker
+    أو شغّل السكربت ده بـ sudo."
+    fi
+    error "Docker غير شغال! جرّب: sudo systemctl enable --now docker"
+  fi
+fi
 
 # ============================================================
-# 2. تحديث النظام وتثبيت الأدوات
+# 2. Update system + dependencies
 # ============================================================
 log "Updating system..."
 pkg_update
 
 log "Installing dependencies..."
-pkg_install curl git ca-certificates
-if [[ "$PKG_MANAGER" == "apt-get" ]]; then
-  pkg_install apt-transport-https 2>/dev/null || true
-fi
+pkg_install curl ca-certificates
+command -v curl &> /dev/null || error "curl غير موجود!"
+success "All prerequisites met."
+
+ARCH="$(detect_arch)"
+[[ "$ARCH" != "unsupported" ]] || error "Unsupported CPU architecture: $(uname -m)"
 
 # ============================================================
-# 3. تثبيت kubectl — مع validation
+# 3. kubectl
 # ============================================================
+install_kubectl_binary() {
+  local version
+  version="${KUBECTL_VERSION:-$(curl -fsSL --connect-timeout 10 --max-time 20 https://dl.k8s.io/release/stable.txt 2>/dev/null || true)}"
+  if [[ -z "$version" ]]; then
+    version="v1.31.2"
+    warn "Could not detect the latest kubectl version — falling back to ${version}."
+  fi
+  log "Installing kubectl ${version}..."
+
+  local path="release/${version}/bin/linux/${ARCH}/kubectl"
+  download "$TMP_DIR/kubectl" "https://dl.k8s.io/${path}" "https://cdn.dl.k8s.io/${path}" \
+    || { network_hint; error "فشل تحميل kubectl!"; }
+
+  if download "$TMP_DIR/kubectl.sha256" "https://dl.k8s.io/${path}.sha256" "https://cdn.dl.k8s.io/${path}.sha256"; then
+    echo "$(cat "$TMP_DIR/kubectl.sha256")  $TMP_DIR/kubectl" | sha256sum --check \
+      || error "kubectl checksum failed!"
+  else
+    warn "Could not fetch kubectl checksum — skipping verification."
+  fi
+
+  $SUDO install -m 0755 "$TMP_DIR/kubectl" /usr/local/bin/kubectl
+}
+
 validate "kubectl"
 if command -v kubectl &> /dev/null; then
-    KUBECTL_INSTALLED=$(kubectl version --client --short 2>/dev/null || kubectl version --client 2>/dev/null | head -1 || echo "unknown version")
-    skip "kubectl — ${KUBECTL_INSTALLED}"
+  skip "kubectl — $(kubectl version --client 2>/dev/null | head -1 || echo 'unknown version')"
 else
-    log "Installing kubectl..."
-    KUBECTL_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
-    curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-
-    curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
-    echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check || error "kubectl checksum failed!"
-    rm kubectl.sha256
-
-    chmod +x kubectl
-    sudo mv kubectl /usr/local/bin/
-    success "kubectl ${KUBECTL_VERSION} installed."
+  case "$PKG_MANAGER" in
+    pacman|apk)
+      log "Installing kubectl from $PKG_MANAGER repos..."
+      pkg_install kubectl || install_kubectl_binary
+      ;;
+    *) install_kubectl_binary ;;
+  esac
+  hash -r
+  success "kubectl installed."
 fi
 
 # ============================================================
-# 4. تثبيت Kind — مع validation
+# 4. Kind
 # ============================================================
-KIND_VERSION="v0.24.0"
+# Failed before because kind.sigs.k8s.io was unreachable (curl hung for 2+ min).
+# Now: distro package first (Arch), then GitHub releases, then kind.sigs.k8s.io,
+# then `go install`. All with short timeouts and retries.
+KIND_VERSION="${KIND_VERSION:-v0.24.0}"
+
+install_kind_binary() {
+  log "Installing Kind ${KIND_VERSION}..."
+  local urls=()
+  [[ -n "${KIND_URL:-}" ]] && urls+=("$KIND_URL")
+  urls+=(
+    "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-${ARCH}"
+    "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${ARCH}"
+  )
+  if download "$TMP_DIR/kind" "${urls[@]}"; then
+    $SUDO install -m 0755 "$TMP_DIR/kind" /usr/local/bin/kind
+    return 0
+  fi
+  if command -v go &> /dev/null; then
+    warn "Binary download failed — trying 'go install'..."
+    GOBIN="$TMP_DIR" go install "sigs.k8s.io/kind@${KIND_VERSION}" \
+      && $SUDO install -m 0755 "$TMP_DIR/kind" /usr/local/bin/kind \
+      && return 0
+  fi
+  network_hint
+  error "فشل تثبيت Kind. نزّله يدوي وحطه في /usr/local/bin أو استخدم KIND_URL=<mirror>."
+}
 
 validate "Kind"
 if command -v kind &> /dev/null; then
-    KIND_INSTALLED=$(kind --version 2>/dev/null)
-    skip "${KIND_INSTALLED}"
+  skip "$(kind --version 2>/dev/null)"
 else
-    log "Installing Kind ${KIND_VERSION}..."
-    curl -Lo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-    chmod +x kind
-    sudo mv kind /usr/local/bin/
-    success "$(kind --version) installed."
+  case "$PKG_MANAGER" in
+    pacman)
+      log "Installing Kind from pacman (extra repo)..."
+      pkg_install kind || install_kind_binary
+      ;;
+    *) install_kind_binary ;;
+  esac
+  hash -r
+  success "$(kind --version) installed."
 fi
 
 # ============================================================
-# 5. استنساخ الـ Repository + نسخ الملفات + cleanup
+# 5. Config files (they live next to this script — no git clone needed)
 # ============================================================
-REPO_URL="https://github.com/omartamer630/setup-configuration.git"
-REPO_DIR="setup-configuration"
-WORK_DIR="$(pwd)/.k8s-config"
+KIND_CONFIG="$SCRIPT_DIR/kind-config.yml"
+INGRESS_FILE="$SCRIPT_DIR/ingress.yml"
+[[ -f "$KIND_CONFIG"  ]] || error "kind-config.yml مش موجود في $SCRIPT_DIR!"
+[[ -f "$INGRESS_FILE" ]] || error "ingress.yml مش موجود في $SCRIPT_DIR!"
 
-validate "Repository"
-if [ -d "${REPO_DIR}/.git" ]; then
-    skip "Repo '${REPO_DIR}'"
-    log "Pulling latest changes..."
-    git -C "$REPO_DIR" pull
-else
-    log "Cloning repository..."
-    git clone "$REPO_URL"
-    success "Repo cloned."
-fi
-
-K8S_DIR="${REPO_DIR}/k8s"
-[ -d "$K8S_DIR" ] || error "المجلد ${K8S_DIR} غير موجود في الـ repo!"
-
-# نسخ الملفات المحتاجينها بس لمجلد مؤقت
-log "Copying required config files..."
-mkdir -p "$WORK_DIR"
-cp "${K8S_DIR}/kind-config.yml" "$WORK_DIR/" 2>/dev/null || error "kind-config.yml مش موجود في ${K8S_DIR}!"
-cp "${K8S_DIR}/ingress.yml"     "$WORK_DIR/" 2>/dev/null || error "ingress.yml مش موجود في ${K8S_DIR}!"
-success "Config files copied to ${WORK_DIR}."
-
-# مسح الـ repo — مش محتاجينه بعد كده
-log "Cleaning up repository folder..."
-rm -rf "$REPO_DIR"
-success "Repository '${REPO_DIR}' removed — no longer needed."
-
-cd "$WORK_DIR"
-
-# ============================================================
-# 6. إنشاء Kind Cluster — مع validation
-# ============================================================
 CLUSTER_NAME="kind"
 
-[ -f "kind-config.yml" ] || error "kind-config.yml مش موجود في $(pwd)!"
-
 # ============================================================
-# 6a. Port availability check (kind-config.yml port mappings)
+# 6. Port availability (only needed if we are going to create the cluster)
 # ============================================================
-REQUIRED_PORTS=(80 443 30000 30001)
-PORT_ERROR_MSG=""
-
-detect_port_process() {
-  local port=$1
-  local pid process
+port_in_use() {
+  local port="$1"
   if command -v ss &>/dev/null; then
-    pid=$(ss -tlnp "sport = :$port" 2>/dev/null | awk -F'pid=' 'NR>1{print $2}' | cut -d, -f1 | head -1)
-    process=$(ss -tlnp "sport = :$port" 2>/dev/null | awk -F'users:' 'NR>1{print $2}' | tr -d '()"' | head -1)
-    [ -z "$process" ] && process="PID $pid"
+    ss -H -tln "sport = :$port" 2>/dev/null | grep -q .
   elif command -v lsof &>/dev/null; then
-    process=$(lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)
-    [ -n "$process" ] && process="PID $process" || process=""
+    lsof -i :"$port" -sTCP:LISTEN &>/dev/null
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") &>/dev/null
   fi
-  echo "$process"
 }
 
-for port in "${REQUIRED_PORTS[@]}"; do
-  if command -v ss &>/dev/null; then
-    if ss -tln "sport = :$port" 2>/dev/null | grep -q LISTEN; then
-      proc=$(detect_port_process "$port")
-      PORT_ERROR_MSG+="  - Port $port is in use by $proc"$'\n'
-    fi
-  elif command -v lsof &>/dev/null; then
-    if lsof -i :"$port" -sTCP:LISTEN &>/dev/null 2>&1; then
-      proc=$(detect_port_process "$port")
-      PORT_ERROR_MSG+="  - Port $port is in use by $proc"$'\n'
-    fi
-  else
-    # fallback: try a simple curl-based check
-    if (echo >/dev/tcp/0.0.0.0/"$port") &>/dev/null 2>&1; then
-      PORT_ERROR_MSG+="  - Port $port is already in use"$'\n'
+cluster_exists() { kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; }
+
+if ! cluster_exists; then
+  REQUIRED_PORTS=(80 443 30000 30001)
+  busy=()
+  for port in "${REQUIRED_PORTS[@]}"; do
+    if port_in_use "$port"; then busy+=("$port"); fi
+  done
+
+  if [[ ${#busy[@]} -gt 0 ]]; then
+    warn "These ports are required by kind-config.yml but are already in use: ${busy[*]}"
+    for port in "${busy[@]}"; do
+      echo "  - $port: $(ss -H -tlnp "sport = :$port" 2>/dev/null | awk '{print $NF}' | head -1)"
+    done
+    echo ""
+    echo "Fix: stop the service (e.g. 'sudo systemctl stop nginx apache2 httpd')"
+    echo "     or edit hostPort values in $KIND_CONFIG"
+    if [[ -t 0 ]]; then
+      read -rp "Press Enter after freeing the ports (Ctrl+C to abort)... "
+      for port in "${busy[@]}"; do
+        port_in_use "$port" && error "Port $port is still in use. Aborting."
+      done
+    else
+      error "Ports in use and no terminal to prompt — aborting."
     fi
   fi
-done
-
-if [ -n "$PORT_ERROR_MSG" ]; then
-  warn "The following ports are required by kind-config.yml but are already in use:"
-  echo -e "$PORT_ERROR_MSG"
-  echo ""
-  echo "To resolve, either:"
-  echo "  1) Stop the service using the port, e.g.:"
-  echo "     sudo systemctl stop nginx"
-  echo "     # or"
-  echo "     sudo lsof -i :80 -sTCP:LISTEN -t | xargs sudo kill"
-  echo ""
-  echo "  2) Or edit kind-config.yml to use different hostPort values"
-  echo ""
-  read -rp "Press Enter after freeing the ports (or Ctrl+C to abort)... "
-  # re-check after user action
-  for port in "${REQUIRED_PORTS[@]}"; do
-    if command -v ss &>/dev/null; then
-      if ss -tln "sport = :$port" 2>/dev/null | grep -q LISTEN; then
-        error "Port $port is still in use. Aborting."
-      fi
-    elif command -v lsof &>/dev/null; then
-      if lsof -i :"$port" -sTCP:LISTEN &>/dev/null 2>&1; then
-        error "Port $port is still in use. Aborting."
-      fi
-    fi
-  done
 fi
 
 # ============================================================
-# 7. إنشاء Kind Cluster — مع validation
+# 7. Kind cluster
 # ============================================================
 validate "Kind cluster '${CLUSTER_NAME}'"
-if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-    skip "Cluster '${CLUSTER_NAME}'"
+if cluster_exists; then
+  skip "Cluster '${CLUSTER_NAME}'"
+  kind export kubeconfig --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
 else
-    log "Creating Kind cluster..."
-    kind create cluster --config kind-config.yml
-    success "Cluster '${CLUSTER_NAME}' created."
+  log "Creating Kind cluster (first run pulls the node image — may take a few minutes)..."
+  kind create cluster --name "$CLUSTER_NAME" --config "$KIND_CONFIG" \
+    || error "فشل إنشاء الـ cluster. لو الخطأ pull image: تأكد إن docker.io/registry شغالين (أو VPN/proxy)."
+  success "Cluster '${CLUSTER_NAME}' created."
 fi
 
+fix_ownership
 kubectl get nodes
 success "Cluster is running."
 
 # ============================================================
-# 7. تثبيت ingress-nginx — مع validation
+# 8. ingress-nginx
 # ============================================================
 INGRESS_VERSION="controller-v1.11.3"
 INGRESS_URL="https://raw.githubusercontent.com/kubernetes/ingress-nginx/${INGRESS_VERSION}/deploy/static/provider/kind/deploy.yaml"
 
 validate "ingress-nginx"
 if kubectl get deployment ingress-nginx-controller -n ingress-nginx &> /dev/null; then
-    INGRESS_READY=$(kubectl get deployment ingress-nginx-controller -n ingress-nginx \
-        -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-    if [ "${INGRESS_READY}" = "1" ]; then
-        skip "ingress-nginx (already running)"
-    else
-        warn "ingress-nginx موجود بس مش ready — هينتظر..."
-    fi
+  READY="$(kubectl get deployment ingress-nginx-controller -n ingress-nginx \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+  if [[ "${READY:-0}" == "1" ]]; then
+    skip "ingress-nginx (already running)"
+  else
+    warn "ingress-nginx موجود بس مش ready — هينتظر..."
+  fi
 else
-    log "Installing ingress-nginx (${INGRESS_VERSION})..."
-    kubectl apply -f "$INGRESS_URL"
-    success "ingress-nginx applied."
+  log "Installing ingress-nginx (${INGRESS_VERSION})..."
+  download "$TMP_DIR/ingress-deploy.yaml" "$INGRESS_URL" \
+    || { network_hint; error "فشل تحميل ingress-nginx manifest!"; }
+  kubectl apply -f "$TMP_DIR/ingress-deploy.yaml"
+  success "ingress-nginx applied."
 fi
 
-log "Waiting for ingress-nginx pod to be ready (max 4 min)..."
-kubectl wait \
-    --namespace ingress-nginx \
-    --for=condition=ready pod \
-    --selector=app.kubernetes.io/component=controller \
-    --timeout=240s
+# `kubectl wait` fails immediately if no pod exists yet — wait for it to appear
+log "Waiting for ingress-nginx controller pod to be created..."
+for _ in $(seq 1 60); do
+  if kubectl get pod -n ingress-nginx -l app.kubernetes.io/component=controller \
+       --no-headers 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 2
+done
 
-log "Waiting for ingress-nginx deployment to be available..."
-kubectl wait \
-    --namespace ingress-nginx \
-    --for=condition=available \
-    deployment/ingress-nginx-controller \
-    --timeout=120s
+log "Waiting for ingress-nginx pod to be ready (max 5 min)..."
+kubectl wait --namespace ingress-nginx --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller --timeout=300s \
+  || error "ingress-nginx pod مش ready. شوف: kubectl -n ingress-nginx describe pod"
 
+kubectl wait --namespace ingress-nginx --for=condition=available \
+  deployment/ingress-nginx-controller --timeout=120s
 success "ingress-nginx is fully ready."
 
 # ============================================================
-# 8. حذف الـ ValidatingWebhook (ضروري في Kind)
+# 9. Remove the ValidatingWebhook (avoids admission failures in Kind)
 # ============================================================
 validate "ValidatingWebhookConfiguration"
 if kubectl get validatingwebhookconfiguration ingress-nginx-admission &> /dev/null; then
-    log "Removing ingress-nginx-admission webhook (required for Kind)..."
-    kubectl delete validatingwebhookconfiguration ingress-nginx-admission
-    success "Webhook removed."
+  log "Removing ingress-nginx-admission webhook (required for Kind)..."
+  kubectl delete validatingwebhookconfiguration ingress-nginx-admission
+  success "Webhook removed."
 else
-    skip "ValidatingWebhookConfiguration (not found, nothing to remove)"
+  skip "ValidatingWebhookConfiguration (not found, nothing to remove)"
 fi
 
 # ============================================================
-# 9. تطبيق ingress.yml — مع validation
+# 10. Apply ingress.yml
 # ============================================================
-[ -f "ingress.yml" ] || error "ingress.yml مش موجود في $(pwd)!"
-
 validate "ingress.yml"
-
-# استخرج اسم الـ ingress من الملف
-INGRESS_NAME=$(grep -m1 'name:' ingress.yml | awk '{print $2}' || true)
-INGRESS_NS=$(grep -m1 'namespace:' ingress.yml | awk '{print $2}' || true)
-INGRESS_NS=${INGRESS_NS:-default}
-
-if [ -n "$INGRESS_NAME" ] && kubectl get ingress "$INGRESS_NAME" -n "$INGRESS_NS" &> /dev/null; then
-    warn "Ingress '${INGRESS_NAME}' موجود بالفعل — هيتعمله re-apply."
-fi
-
 log "Applying ingress.yml..."
-kubectl apply -f ingress.yml
+kubectl apply -f "$INGRESS_FILE"
 success "ingress.yml applied."
 
 # ============================================================
-# 10. مسح الـ config files المؤقتة
+# 11. Summary
 # ============================================================
-log "Cleaning up temporary config files..."
-rm -rf "$WORK_DIR"
-success "Temp config folder removed."
-
-# ============================================================
-# 11. ملخص نهائي
-# ============================================================
+fix_ownership
 echo ""
 echo "========================================"
 success "Setup completed successfully!"
@@ -304,3 +319,5 @@ kubectl get nodes
 echo ""
 log "All resources:"
 kubectl get all -A
+echo ""
+log "kubeconfig: $KUBECONFIG  (owner: $TARGET_USER)"
