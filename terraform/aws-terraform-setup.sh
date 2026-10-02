@@ -20,32 +20,15 @@ skip()     { echo -e "${BLUE}[~]${NC} $1 — already installed, skipping."; }
 validate() { echo -e "${BLUE}[?]${NC} Validating: $1"; }
 
 # ============================================================
-#  Distro detection
+#  Load package manager abstraction
 # ============================================================
-detect_distro() {
-  [[ -f /etc/os-release ]] || error "Cannot detect OS: /etc/os-release not found."
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  DISTRO_ID="${ID:-}"
-  DISTRO_LIKE="${ID_LIKE:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+# shellcheck source=../lib/pkg.sh
+source "$LIB_DIR/pkg.sh"
 
-  if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]; then
-    PKG_MGR="apt"
-    PKG_UPDATE="sudo apt update -y"
-    PKG_INSTALL="sudo apt install -y"
-    DEBIAN_FAMILY=true
-  elif [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]; then
-    PKG_MGR="dnf"
-    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
-    PKG_UPDATE="sudo $PKG_MGR check-update -y || true"
-    PKG_INSTALL="sudo $PKG_MGR install -y"
-    DEBIAN_FAMILY=false
-  else
-    error "Unsupported distro: $DISTRO_ID. Supported: Ubuntu, Debian, RHEL, CentOS, Rocky, AlmaLinux, Fedora."
-  fi
-}
-
-detect_distro
+# PKG_MANAGER is now detected and available from lib/pkg.sh
+# pkg_update, pkg_install, ensure functions are available
 
 # ============================================================
 # 1. التحقق من المتطلبات الأساسية
@@ -60,13 +43,13 @@ success "All prerequisites met."
 # 2. تحديث النظام وتثبيت الأدوات
 # ============================================================
 log "Updating system..."
-$PKG_UPDATE
+pkg_update
 
 log "Installing dependencies..."
-if [[ "$DEBIAN_FAMILY" == true ]]; then
-  $PKG_INSTALL unzip curl gnupg software-properties-common lsb-release
-else
-  $PKG_INSTALL unzip curl gnupg
+pkg_install unzip curl gnupg
+
+if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+  pkg_install software-properties-common lsb-release
 fi
 
 # ============================================================
@@ -100,7 +83,7 @@ if command -v terraform &> /dev/null; then
     TF_INSTALLED=$(terraform version 2>/dev/null | head -1 || echo "unknown version")
     skip "Terraform — ${TF_INSTALLED}"
 else
-    if [[ "$DEBIAN_FAMILY" == true ]]; then
+    if [[ "$PKG_MANAGER" == "apt-get" ]]; then
       log "Adding HashiCorp GPG key..."
       curl -fsSL https://apt.releases.hashicorp.com/gpg \
           | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg \
@@ -111,16 +94,16 @@ else
           | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
 
       log "Updating apt and installing Terraform..."
-      sudo apt update -y
-      sudo apt install -y terraform || error "فشل تثبيت Terraform!"
+      pkg_update
+      pkg_install terraform || error "فشل تثبيت Terraform!"
     else
       log "Adding HashiCorp yum repository..."
-      $PKG_INSTALL dnf-plugins-core 2>/dev/null || true
-      sudo $PKG_MGR config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo 2>/dev/null \
-        || sudo $PKG_MGR config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
+      pkg_install dnf-plugins-core 2>/dev/null || true
+      sudo $PKG_MANAGER config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo 2>/dev/null \
+        || sudo $PKG_MANAGER config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
 
       log "Installing Terraform..."
-      sudo $PKG_MGR install -y terraform || error "فشل تثبيت Terraform!"
+      sudo $PKG_MANAGER install -y terraform || error "فشل تثبيت Terraform!"
     fi
 
     success "Terraform installed: $(terraform version | head -1)"

@@ -20,30 +20,15 @@ skip()     { echo -e "${BLUE}[~]${NC} $1 — already installed, skipping."; }
 validate() { echo -e "${BLUE}[?]${NC} Validating: $1"; }
 
 # ============================================================
-#  Distro detection
+#  Load package manager abstraction
 # ============================================================
-detect_distro() {
-  [[ -f /etc/os-release ]] || error "Cannot detect OS: /etc/os-release not found."
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  DISTRO_ID="${ID:-}"
-  DISTRO_LIKE="${ID_LIKE:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+# shellcheck source=../lib/pkg.sh
+source "$LIB_DIR/pkg.sh"
 
-  if [[ "$DISTRO_ID" == "ubuntu" || "$DISTRO_ID" == "debian" || "$DISTRO_LIKE" == *debian* ]]; then
-    PKG_MGR="apt"
-    PKG_UPDATE="sudo apt update -y"
-    PKG_INSTALL="sudo apt install -y"
-  elif [[ "$DISTRO_ID" =~ ^(rhel|centos|rocky|almalinux|fedora)$ || "$DISTRO_LIKE" == *rhel* || "$DISTRO_LIKE" == *fedora* ]]; then
-    PKG_MGR="dnf"
-    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
-    PKG_UPDATE="sudo $PKG_MGR check-update -y || true"
-    PKG_INSTALL="sudo $PKG_MGR install -y"
-  else
-    error "Unsupported distro: $DISTRO_ID. Supported: Ubuntu, Debian, RHEL, CentOS, Rocky, AlmaLinux, Fedora."
-  fi
-}
-
-detect_distro
+# PKG_MANAGER is now detected and available from lib/pkg.sh
+# pkg_update, pkg_install, ensure functions are available
 
 # ============================================================
 # 1. التحقق من المتطلبات الأساسية
@@ -61,11 +46,13 @@ success "All prerequisites met."
 # 2. تحديث النظام وتثبيت الأدوات
 # ============================================================
 log "Updating system..."
-$PKG_UPDATE
+pkg_update
 
 log "Installing dependencies..."
-$PKG_INSTALL curl git ca-certificates
-$PKG_INSTALL apt-transport-https 2>/dev/null || true
+pkg_install curl git ca-certificates
+if [[ "$PKG_MANAGER" == "apt-get" ]]; then
+  pkg_install apt-transport-https 2>/dev/null || true
+fi
 
 # ============================================================
 # 3. تثبيت kubectl — مع validation
